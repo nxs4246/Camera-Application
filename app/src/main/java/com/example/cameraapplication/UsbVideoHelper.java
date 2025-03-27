@@ -12,15 +12,19 @@ public class UsbVideoHelper {
         UsbManager usbManager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
         HashMap<String, UsbDevice> deviceList = usbManager.getDeviceList();
 
-        for (UsbDevice device : deviceList.values()) {
-            // UVC devices typically have the video class (0x0E)
-            // can add your own
-            if (device.getDeviceClass() == 0x0E) {
-                Log.d("UsbVideoHelper", "Found UVC device: " + device.getDeviceName());
-                return device;
-            }
+        if (deviceList.isEmpty()) {
+            // Log.d("UsbVideoHelper", "No USB devices found.");
+            return null;
         }
-        Log.d("UsbVideoHelper", "No UVC device found.");
+
+        // Iterate over all devices
+        for (UsbDevice device : deviceList.values()) {
+            // Log.d("UsbVideoHelper", "Found USB device: " + device.getDeviceName() + " (Vendor ID: " + device.getVendorId() + ", Product ID: " + device.getProductId() + ")");
+            // Return the first device found
+            return device;
+        }
+
+        // Log.d("UsbVideoHelper", "No USB devices found.");
         return null;
     }
 }

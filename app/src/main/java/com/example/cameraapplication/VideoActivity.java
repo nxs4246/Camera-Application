@@ -14,6 +14,7 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.widget.TextView;
 import android.widget.Toast;
 import android.app.Activity;
 import android.app.PendingIntent;
@@ -27,10 +28,15 @@ import android.hardware.usb.UsbManager;
 import java.nio.ByteBuffer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Locale;
 
 public class VideoActivity extends Activity implements SurfaceHolder.Callback {
 
+    private static final String TAG = "VideoActivity";
     private static final String ACTION_USB_PERMISSION = "com.example.cameraapplication.USB_PERMISSION";
+    private static final int MAX_RETRY_ATTEMPTS = 3;
+
     private UsbDevice usbDevice;
     private UsbDeviceConnection usbConnection;
     private SurfaceView surfaceView;
@@ -38,7 +44,14 @@ public class VideoActivity extends Activity implements SurfaceHolder.Callback {
     private UsbManager usbManager;
     private PendingIntent permissionIntent;
     private UsbEndpoint videoEndpoint;
-    private boolean isCapturing = false;
+    private UsbInterface videoInterface;
+
+    private TextView statusTextView;
+
+    private final AtomicBoolean isCapturing = new AtomicBoolean(false);
+    private final AtomicBoolean shouldRetry = new AtomicBoolean(true);
+    private int retryAttempts = 0;
+
     private ExecutorService executor = Executors.newSingleThreadExecutor();
     private Handler mainHandler = new Handler(Looper.getMainLooper());
 
@@ -53,6 +66,7 @@ public class VideoActivity extends Activity implements SurfaceHolder.Callback {
                             openUsbDevice(device);
                         }
                     } else {
+                        Log.e(TAG, "USB permission denied");
                         Toast.makeText(context, "USB permission denied", Toast.LENGTH_SHORT).show();
                     }
                 }
@@ -62,10 +76,10 @@ public class VideoActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        statusTextView = findViewById(R.id.statusTextView);
         surfaceView = findViewById(R.id.surfaceView);
         surfaceHolder = surfaceView.getHolder();
         surfaceHolder.addCallback(this);
@@ -73,7 +87,8 @@ public class VideoActivity extends Activity implements SurfaceHolder.Callback {
         usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
         usbDevice = UsbVideoHelper.findUvcDevice(this);
 
-        permissionIntent = PendingIntent.getBroadcast(this, 0, new Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE);
+        permissionIntent = PendingIntent.getBroadcast(this, 0,
+                new Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE);
         IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -89,112 +104,129 @@ public class VideoActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    private void openUsbDevice(UsbDevice device) {
+    private void updateStatus(String message) {
+        mainHandler.post(() -> {
+            if (statusTextView != null) {
+                statusTextView.setText(message);
+            }
+        });
+    }
+
+    public void openUsbDevice(UsbDevice device) {
+        String deviceInfo = String.format(Locale.ENGLISH, "USB Device Connected: %s\nVendor ID: %d, Product ID: %d",
+                device.getDeviceName(),
+                device.getVendorId(),
+                device.getProductId()
+        );
+        updateStatus(deviceInfo);
+
         usbConnection = usbManager.openDevice(device);
         if (usbConnection != null) {
             startVideoCapture();
         } else {
-            Log.e("VideoActivity", "Failed to open USB device");
-            mainHandler.post(() -> Toast.makeText(this, "Failed to connect to USB device", Toast.LENGTH_SHORT).show());
+            Log.e(TAG, "Failed to open USB device");
+            mainHandler.post(() -> Toast.makeText(this,
+                    "Failed to connect to USB device", Toast.LENGTH_SHORT).show());
         }
     }
 
-    private void startVideoCapture() {
+    public void startVideoCapture() {
         if (usbConnection == null) {
-            Log.e("VideoActivity", "USB connection is null");
-            mainHandler.post(() -> Toast.makeText(this, "USB connection error", Toast.LENGTH_SHORT).show());
+            Log.e(TAG, "USB connection is null");
             return;
         }
 
-        UsbInterface videoInterface = null;
-        for (int i = 0; i < usbDevice.getInterfaceCount(); i++) {
-            UsbInterface iface = usbDevice.getInterface(i);
-            if (iface.getInterfaceClass() == UsbConstants.USB_CLASS_VIDEO) {
-                videoInterface = iface;
-                break;
-            }
-        }
-
+        videoInterface = findVideoInterface();
         if (videoInterface == null) {
-            Log.e("VideoActivity", "Video interface not found");
-            mainHandler.post(() -> Toast.makeText(this, "Video interface error", Toast.LENGTH_SHORT).show());
+            Log.e(TAG, "Video interface not found");
             return;
         }
 
         if (usbConnection.claimInterface(videoInterface, true)) {
-            for (int i = 0; i < videoInterface.getEndpointCount(); i++) {
-                UsbEndpoint endpoint = videoInterface.getEndpoint(i);
-                if (endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK && endpoint.getDirection() == UsbConstants.USB_DIR_IN) {
-                    videoEndpoint = endpoint;
-                    break;
-                }
-            }
-
+            videoEndpoint = findVideoEndpoint(videoInterface);
             if (videoEndpoint == null) {
-                Log.e("VideoActivity", "Video endpoint not found");
-                mainHandler.post(() -> Toast.makeText(this, "Video endpoint error", Toast.LENGTH_SHORT).show());
+                Log.e(TAG, "Video endpoint not found");
                 usbConnection.releaseInterface(videoInterface);
                 return;
             }
 
-            isCapturing = true;
+            isCapturing.set(true);
+            shouldRetry.set(true);
+            retryAttempts = 0;
             startVideoReading();
-
         } else {
-            Log.e("VideoActivity", "Failed to claim video interface");
-            mainHandler.post(() -> Toast.makeText(this, "Failed to claim video interface", Toast.LENGTH_SHORT).show());
+            Log.e(TAG, "Failed to claim video interface");
         }
     }
 
-    private void startVideoReading() {
+    private UsbInterface findVideoInterface() {
+        for (int i = 0; i < usbDevice.getInterfaceCount(); i++) {
+            UsbInterface iface = usbDevice.getInterface(i);
+            if (iface.getInterfaceClass() == UsbConstants.USB_CLASS_VIDEO) {
+                return iface;
+            }
+        }
+        return null;
+    }
+
+    private UsbEndpoint findVideoEndpoint(UsbInterface videoInterface) {
+        for (int i = 0; i < videoInterface.getEndpointCount(); i++) {
+            UsbEndpoint endpoint = videoInterface.getEndpoint(i);
+            if (endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK
+                    && endpoint.getDirection() == UsbConstants.USB_DIR_IN) {
+                return endpoint;
+            }
+        }
+        return null;
+    }
+
+    public void startVideoReading() {
         executor.execute(() -> {
-            if (usbConnection == null) {
-                Log.e("VideoActivity", "USB connection is null");
-                mainHandler.post(() -> Toast.makeText(this, "USB connection error", Toast.LENGTH_SHORT).show());
-                isCapturing = false;
-                return;
-            }
-            if (videoEndpoint == null) {
-                Log.e("VideoActivity", "Video endpoint is null");
-                mainHandler.post(() -> Toast.makeText(this, "Video endpoint error", Toast.LENGTH_SHORT).show());
-                isCapturing = false;
-                return;
-            }
+            while (isCapturing.get() && shouldRetry.get() && retryAttempts < MAX_RETRY_ATTEMPTS) {
+                try {
+                    readVideoStream();
+                } catch (Exception e) {
+                    Log.e(TAG, "Video capture error", e);
+                    retryAttempts++;
 
-            ByteBuffer buffer = ByteBuffer.allocate(videoEndpoint.getMaxPacketSize() * 1024);
-            UsbRequest request = new UsbRequest();
-            request.initialize(usbConnection, videoEndpoint);
-
-            while (isCapturing) {
-                if (request.queue(buffer, buffer.capacity())) {
-                    if (usbConnection.requestWait() == request) {
-                        byte[] data = buffer.array();
-                        mainHandler.post(() -> displayFrame(data));
-                        buffer.clear();
-                    } else {
-                        Log.e("VideoActivity", "requestWait failed");
-                        mainHandler.post(() -> Toast.makeText(this, "Video capture error", Toast.LENGTH_SHORT).show());
-                        isCapturing = false;
+                    if (retryAttempts >= MAX_RETRY_ATTEMPTS) {
+                        mainHandler.post(() -> {
+                            Toast.makeText(this, "Failed to capture video", Toast.LENGTH_SHORT).show();
+                            isCapturing.set(false);
+                            shouldRetry.set(false);
+                        });
                     }
-                } else {
-                    Log.e("VideoActivity", "request.queue failed");
-                    mainHandler.post(() -> Toast.makeText(this, "Video capture error", Toast.LENGTH_SHORT).show());
-                    isCapturing = false;
                 }
             }
-            request.close();
-
         });
     }
 
-    private void displayFrame(byte[] data) {
-        Bitmap bitmap = BitmapFactory.decodeByteArray(data, 0, data.length);
-        if (bitmap != null) {
-            Canvas canvas = surfaceHolder.lockCanvas();
-            if (canvas != null) {
-                canvas.drawBitmap(bitmap, 0, 0, null);
-                surfaceHolder.unlockCanvasAndPost(canvas);
+    private void readVideoStream() {
+        ByteBuffer buffer = ByteBuffer.allocate(videoEndpoint.getMaxPacketSize() * 1024);
+        UsbRequest request = new UsbRequest();
+        request.initialize(usbConnection, videoEndpoint);
+
+        if (request.queue(buffer, buffer.capacity())) {
+            if (usbConnection.requestWait() == request) {
+                byte[] data = buffer.array();
+                mainHandler.post(() -> displayFrame(data));
             }
+        }
+        request.close();
+    }
+
+    public void displayFrame(byte[] data) {
+        try {
+            Bitmap bitmap = BitmapFactory.decodeByteArray(data, 0, data.length);
+            if (bitmap != null) {
+                Canvas canvas = surfaceHolder.lockCanvas();
+                if (canvas != null) {
+                    canvas.drawBitmap(bitmap, 0, 0, null);
+                    surfaceHolder.unlockCanvasAndPost(canvas);
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error displaying frame", e);
         }
     }
 
@@ -207,16 +239,28 @@ public class VideoActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        // Potential future implementation for resize
     }
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        isCapturing = false;
+        stopVideoCapture();
+    }
+
+    private void stopVideoCapture() {
+        isCapturing.set(false);
+        shouldRetry.set(false);
+
+        if (usbConnection != null && videoInterface != null) {
+            usbConnection.releaseInterface(videoInterface);
+            usbConnection.close();
+        }
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        stopVideoCapture();
         unregisterReceiver(usbReceiver);
         executor.shutdown();
     }
